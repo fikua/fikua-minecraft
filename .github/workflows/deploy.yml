@@ -1,0 +1,150 @@
+name: Deploy Minecraft to VPS
+
+# Manual only: the org's GitHub plan cannot put required reviewers on an
+# environment, so a push trigger would deploy unsupervised. Clicking
+# "Run workflow" is the approval. Only users with write access can.
+#
+# This repo is PUBLIC and so are its Actions logs. Every private value is
+# a repo secret (GitHub masks secret values in logs); never echo container
+# logs or the host .env from here.
+#
+# Repo secrets this workflow reads (besides the org SSH ones):
+#   MINECRAFT_PLAYERS        comma-separated usernames (whitelist + ops)
+#   MINECRAFT_RCON_PASSWORD  openssl rand -hex 24 (hex: no `$` for Compose to eat)
+#   MINECRAFT_BIND_IP        the VPS's WireGuard address
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (latest, or sha-<short> from build.yml)'
+        required: false
+        default: 'latest'
+        type: string
+
+concurrency:
+  group: deploy-minecraft-prd
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.image_tag }} to prd
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment:
+      name: prd
+
+    steps:
+      - name: Checkout (for the compose file)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Check repo secrets
+        env:
+          MINECRAFT_PLAYERS: ${{ secrets.MINECRAFT_PLAYERS }}
+          MINECRAFT_RCON_PASSWORD: ${{ secrets.MINECRAFT_RCON_PASSWORD }}
+          MINECRAFT_BIND_IP: ${{ secrets.MINECRAFT_BIND_IP }}
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+        run: |
+          missing=0
+          for v in MINECRAFT_PLAYERS MINECRAFT_RCON_PASSWORD MINECRAFT_BIND_IP VPS_SSH_PRIVATE_KEY; do
+            if [ -z "${!v}" ]; then echo "::error::secret $v is empty or not visible to this repo"; missing=1; fi
+          done
+          exit $missing
+
+      - name: Install cloudflared
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Configure SSH client (tunnel + key + known_hosts)
+        env:
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" > ~/.ssh/vps_id
+          chmod 600 ~/.ssh/vps_id
+          ssh-keygen -y -f ~/.ssh/vps_id >/dev/null
+
+          cat <<'EOF' > ~/.ssh/config
+          Host vps.fikua.com
+              User ubuntu
+              IdentityFile ~/.ssh/vps_id
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+              ProxyCommand cloudflared access ssh --hostname %h
+              ServerAliveInterval 30
+              ServerAliveCountMax 4
+          EOF
+          chmod 600 ~/.ssh/config
+
+          echo "CF_ACCESS_CLIENT_ID=$CF_ACCESS_CLIENT_ID" >> "$GITHUB_ENV"
+          echo "CF_ACCESS_CLIENT_SECRET=$CF_ACCESS_CLIENT_SECRET" >> "$GITHUB_ENV"
+
+      - name: Warn if docker.service is not ordered after wg0
+        # The port binds on the wg0 address; without the IaC wireguard
+        # role's drop-in a reboot can leave the server down. The deploy
+        # still works, so this only warns.
+        run: |
+          if ! ssh vps.fikua.com 'systemctl show docker -p After' | grep -q 'wg-quick@wg0'; then
+            echo "::warning::docker.service is not ordered after wg-quick@wg0 — apply the wireguard role in fikua-platform-iac"
+          fi
+
+      - name: Copy compose.yaml and write .env
+        env:
+          MINECRAFT_PLAYERS: ${{ secrets.MINECRAFT_PLAYERS }}
+          MINECRAFT_RCON_PASSWORD: ${{ secrets.MINECRAFT_RCON_PASSWORD }}
+          MINECRAFT_BIND_IP: ${{ secrets.MINECRAFT_BIND_IP }}
+        run: |
+          ssh vps.fikua.com 'sudo mkdir -p /opt/vps/projects/minecraft /opt/vps/backups/minecraft && sudo chown ubuntu:ubuntu /opt/vps/projects/minecraft'
+          scp compose.yaml vps.fikua.com:/opt/vps/projects/minecraft/compose.yaml
+
+          # Through stdin, never the command line, so secrets do not land
+          # in the remote process list or shell history.
+          printf 'MINECRAFT_PLAYERS=%s\nMINECRAFT_RCON_PASSWORD=%s\nMINECRAFT_BIND_IP=%s\n' \
+            "$MINECRAFT_PLAYERS" "$MINECRAFT_RCON_PASSWORD" "$MINECRAFT_BIND_IP" \
+            | ssh vps.fikua.com 'umask 077 && cat > /opt/vps/projects/minecraft/.env'
+
+      - name: Pull and restart on the VPS
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          ssh vps.fikua.com "
+            set -e
+            cd /opt/vps/projects/minecraft
+            MINECRAFT_IMAGE_TAG='$IMAGE_TAG' sudo --preserve-env=MINECRAFT_IMAGE_TAG docker compose pull --quiet
+            MINECRAFT_IMAGE_TAG='$IMAGE_TAG' sudo --preserve-env=MINECRAFT_IMAGE_TAG docker compose up -d
+          "
+
+      - name: Wait for the server to report healthy
+        # First start downloads server.jar and generates the world — a few
+        # minutes on this CPU. On failure, read the logs over SSH, not here:
+        # they carry player names and addresses.
+        run: |
+          for i in $(seq 1 60); do
+            status=$(ssh vps.fikua.com "sudo docker inspect -f '{{.State.Health.Status}}' minecraft" || true)
+            echo "attempt $i: $status"
+            if [ "$status" = "healthy" ]; then exit 0; fi
+            sleep 10
+          done
+          echo "::error::minecraft did not report healthy within 10 minutes — check 'docker logs minecraft' on the host"
+          exit 1
+
+      - name: Check the port is only on the VPN address
+        env:
+          MINECRAFT_BIND_IP: ${{ secrets.MINECRAFT_BIND_IP }}
+        run: |
+          listeners=$(ssh vps.fikua.com "sudo ss -tlnH 'sport = :25565'")
+          if ! grep -qF "$MINECRAFT_BIND_IP:25565" <<<"$listeners"; then
+            echo "::error::25565 is not bound on the VPN address"; exit 1
+          fi
+          if grep -Eq '(0\.0\.0\.0|\[::\]|\*):25565' <<<"$listeners"; then
+            echo "::error::25565 is bound on a public wildcard address"; exit 1
+          fi
+          echo "25565 bound on the VPN address only"

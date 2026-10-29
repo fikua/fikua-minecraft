@@ -1,0 +1,3 @@
+# Host env file: written by deploy.yml from repo secrets, never committed.
+.env
+.env.*

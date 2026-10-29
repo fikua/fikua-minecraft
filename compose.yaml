@@ -1,0 +1,85 @@
+# Fikua private Minecraft server — deployment
+#
+# Image: docker.io/fikua/minecraft-server (built from this repo's
+# Dockerfile by .github/workflows/build.yml).
+#
+# Source of truth for this file:
+#   fikua-platform-iac/projects/minecraft/compose.yaml
+# A copy travels with this repo so deploy.yml can push it to the host on
+# every deploy — keep both in sync (same convention as niu). This repo is
+# public: keep this file free of private values.
+#
+# Host path on the VPS: /opt/vps/projects/minecraft/
+#
+# Private by network: the game port is published ONLY on the VPS's
+# WireGuard address (MINECRAFT_BIND_IP), never on the public interface.
+# Every value below without a default comes from the host .env, which
+# deploy.yml writes from repo secrets.
+
+services:
+  minecraft:
+    image: fikua/minecraft-server:${MINECRAFT_IMAGE_TAG:-latest}
+    container_name: minecraft
+    restart: unless-stopped
+    ports:
+      - "${MINECRAFT_BIND_IP:?set MINECRAFT_BIND_IP in .env}:25565:25565"
+    environment:
+      MEMORY: ${MINECRAFT_HEAP:-2G}
+      WHITELIST: ${MINECRAFT_PLAYERS:?set MINECRAFT_PLAYERS in .env}
+      OPS: ${MINECRAFT_PLAYERS}
+      # RCON is how minecraft-backup flushes the world before archiving
+      # it. Never published — only reachable on this project's network.
+      RCON_PASSWORD: ${MINECRAFT_RCON_PASSWORD:?set MINECRAFT_RCON_PASSWORD in .env}
+    volumes:
+      - minecraft-data:/data
+    # Time to save every loaded chunk on stop instead of a SIGKILL mid-write.
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits:
+          # 2G heap + ~1G JVM/off-heap overhead.
+          memory: 3G
+          # World generation is the CPU spike; leave a core for the rest
+          # of the host.
+          cpus: '3'
+    logging:
+      driver: json-file
+      options:
+        max-size: "25m"
+        max-file: "3"
+
+  # Daily world archive, consistent while the server keeps running
+  # (RCON save-off / save-all / save-on around the tar).
+  minecraft-backup:
+    image: itzg/mc-backup:latest@sha256:430354fb600a4dd0582d523a05166330cfc122acee69157500bc7a0559654d3e
+    container_name: minecraft-backup
+    restart: unless-stopped
+    depends_on:
+      minecraft:
+        condition: service_healthy
+    environment:
+      RCON_HOST: minecraft
+      RCON_PASSWORD: ${MINECRAFT_RCON_PASSWORD}
+      BACKUP_INTERVAL: 24h
+      INITIAL_DELAY: 5m
+      PRUNE_BACKUPS_DAYS: "7"
+      # No archive when nobody played since the last one.
+      PAUSE_IF_NO_PLAYERS: "true"
+      TZ: Europe/Madrid
+    volumes:
+      - minecraft-data:/data:ro
+      - /opt/vps/backups/minecraft:/backups
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  minecraft-data:
+    name: minecraft-data

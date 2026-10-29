@@ -1,0 +1,15 @@
+# Base image and action bumps arrive as PRs, never silently.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
